@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Fog Node — Worker HPC
 
 Service FastAPI identique sur les trois laptops physiques (`fog-1`, `fog-2`, `fog-3`).
