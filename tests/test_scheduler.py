@@ -1,5 +1,8 @@
+import asyncio
+
 import httpx
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import scheduler.main as scheduler
@@ -8,6 +11,8 @@ import scheduler.main as scheduler
 @pytest.fixture(autouse=True)
 def reset_round_robin_state(monkeypatch):
     monkeypatch.setattr(scheduler, "_round_robin_index", 0)
+    monkeypatch.setattr(scheduler, "_in_flight", {})
+    monkeypatch.setattr(scheduler, "_selection_lock", asyncio.Lock())
 
 
 def worker_status(
@@ -16,6 +21,7 @@ def worker_status(
     reachable=True,
     available=True,
     running_jobs=0,
+    max_running=2,
     cpu_percent=10.0,
     node_id="fog",
 ):
@@ -25,10 +31,25 @@ def worker_status(
         "available": available,
         "node_id": node_id,
         "running_jobs": running_jobs,
-        "max_running": 2,
+        "max_running": max_running,
         "cpu_percent": cpu_percent,
         "ram_percent": 50.0,
     }
+
+
+class FakeResponse:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            request = httpx.Request("GET", "http://test.local")
+            response = httpx.Response(self.status_code, request=request)
+            raise httpx.HTTPStatusError("HTTP error", request=request, response=response)
+
+    def json(self):
+        return self._payload
 
 
 def test_select_node_prefers_fewer_running_jobs():
@@ -79,6 +100,35 @@ def test_select_node_rotates_equal_load_workers_fairly():
         "http://fog-1.local:8001",
         "http://fog-2.local:8001",
     ]
+
+
+def test_reserve_node_skips_worker_when_effective_capacity_is_reached():
+    async def scenario():
+        scheduler._in_flight["http://fog-1.local:8001"] = 1
+        selected = await scheduler.reserve_node(
+            [
+                worker_status(
+                    "http://fog-1.local:8001",
+                    running_jobs=1,
+                    max_running=2,
+                    cpu_percent=10.0,
+                ),
+                worker_status(
+                    "http://fog-2.local:8001",
+                    running_jobs=0,
+                    max_running=2,
+                    cpu_percent=50.0,
+                ),
+            ]
+        )
+
+        assert selected["url"] == "http://fog-2.local:8001"
+        assert scheduler._in_flight == {
+            "http://fog-1.local:8001": 1,
+            "http://fog-2.local:8001": 1,
+        }
+
+    asyncio.run(scenario())
 
 
 def test_health_returns_configured_node_count(monkeypatch):
@@ -218,6 +268,228 @@ def test_jobs_dispatches_valid_monte_carlo_job_to_available_worker(monkeypatch):
         "worker_result": worker_payload,
     }
     assert scheduler.history["scheduler-job-1"] == response_json
+    assert scheduler._in_flight == {}
+
+
+def test_concurrent_jobs_distribute_across_equal_available_workers(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr(
+            scheduler,
+            "NODES",
+            ["http://fog-1.local:8001", "http://fog-2.local:8001"],
+        )
+        post_urls = []
+        both_posts_started = asyncio.Event()
+
+        class ConcurrentAsyncClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return None
+
+            async def get(self, url, timeout):
+                node_id = "fog-1" if "fog-1" in url else "fog-2"
+                return FakeResponse(
+                    200,
+                    worker_status(url.removesuffix("/status"), node_id=node_id),
+                )
+
+            async def post(self, url, json, timeout):
+                post_urls.append(url)
+                if len(post_urls) == 2:
+                    both_posts_started.set()
+                await both_posts_started.wait()
+                node_id = "fog-1" if "fog-1" in url else "fog-2"
+                return FakeResponse(
+                    200,
+                    {
+                        "job_id": f"{node_id}-job",
+                        "status": "completed",
+                        "node_id": node_id,
+                        "result": {"pi_estimate": 3.14},
+                        "execution_seconds": 0.01,
+                    },
+                )
+
+        monkeypatch.setattr(scheduler.httpx, "AsyncClient", ConcurrentAsyncClient)
+
+        job = scheduler.Job(kind="monte_carlo", size=10000, seed=42)
+        await asyncio.gather(scheduler.submit(job), scheduler.submit(job))
+
+        assert sorted(post_urls) == [
+            "http://fog-1.local:8001/jobs",
+            "http://fog-2.local:8001/jobs",
+        ]
+        assert scheduler._in_flight == {}
+
+    asyncio.run(scenario())
+
+
+def test_reservation_released_after_worker_503_and_next_worker_is_tried(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr(
+            scheduler,
+            "NODES",
+            ["http://fog-1.local:8001", "http://fog-2.local:8001"],
+        )
+        post_urls = []
+
+        class CapacityThenSuccessClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return None
+
+            async def get(self, url, timeout):
+                node_id = "fog-1" if "fog-1" in url else "fog-2"
+                return FakeResponse(
+                    200,
+                    worker_status(url.removesuffix("/status"), node_id=node_id),
+                )
+
+            async def post(self, url, json, timeout):
+                post_urls.append(url)
+                if "fog-1" in url:
+                    assert scheduler._in_flight == {"http://fog-1.local:8001": 1}
+                    return FakeResponse(503, {"detail": "Worker at capacity"})
+                assert scheduler._in_flight == {"http://fog-2.local:8001": 1}
+                return FakeResponse(
+                    200,
+                    {
+                        "job_id": "worker-job-2",
+                        "status": "completed",
+                        "node_id": "fog-2",
+                        "result": {"pi_estimate": 3.14},
+                        "execution_seconds": 0.01,
+                    },
+                )
+
+        monkeypatch.setattr(scheduler.httpx, "AsyncClient", CapacityThenSuccessClient)
+
+        result = await scheduler.submit(scheduler.Job(kind="monte_carlo", size=10000, seed=42))
+
+        assert post_urls == [
+            "http://fog-1.local:8001/jobs",
+            "http://fog-2.local:8001/jobs",
+        ]
+        assert result["worker_url"] == "http://fog-2.local:8001"
+        assert scheduler._in_flight == {}
+
+    asyncio.run(scenario())
+
+
+def test_reservation_released_after_timeout(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr(scheduler, "NODES", ["http://fog-1.local:8001"])
+        post_urls = []
+
+        class TimeoutClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return None
+
+            async def get(self, url, timeout):
+                return FakeResponse(200, worker_status("http://fog-1.local:8001", node_id="fog-1"))
+
+            async def post(self, url, json, timeout):
+                post_urls.append(url)
+                raise httpx.TimeoutException("request timed out")
+
+        monkeypatch.setattr(scheduler.httpx, "AsyncClient", TimeoutClient)
+
+        with pytest.raises(HTTPException) as exc:
+            await scheduler.submit(scheduler.Job(kind="monte_carlo", size=10000, seed=42))
+
+        assert exc.value.status_code == 504
+        assert post_urls == ["http://fog-1.local:8001/jobs"]
+        assert scheduler._in_flight == {}
+
+    asyncio.run(scenario())
+
+
+def test_reservation_released_after_http_error(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr(scheduler, "NODES", ["http://fog-1.local:8001"])
+        post_urls = []
+
+        class ErrorClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return None
+
+            async def get(self, url, timeout):
+                return FakeResponse(200, worker_status("http://fog-1.local:8001", node_id="fog-1"))
+
+            async def post(self, url, json, timeout):
+                post_urls.append(url)
+                raise httpx.ConnectError(
+                    "connection failed",
+                    request=httpx.Request("POST", url),
+                )
+
+        monkeypatch.setattr(scheduler.httpx, "AsyncClient", ErrorClient)
+
+        with pytest.raises(HTTPException) as exc:
+            await scheduler.submit(scheduler.Job(kind="monte_carlo", size=10000, seed=42))
+
+        assert exc.value.status_code == 502
+        assert post_urls == ["http://fog-1.local:8001/jobs"]
+        assert scheduler._in_flight == {}
+
+    asyncio.run(scenario())
+
+
+def test_reservation_released_after_task_cancellation(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr(scheduler, "NODES", ["http://fog-1.local:8001"])
+        post_started = asyncio.Event()
+        keep_post_open = asyncio.Event()
+
+        class HangingClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return None
+
+            async def get(self, url, timeout):
+                return FakeResponse(200, worker_status("http://fog-1.local:8001", node_id="fog-1"))
+
+            async def post(self, url, json, timeout):
+                post_started.set()
+                await keep_post_open.wait()
+                return FakeResponse(
+                    200,
+                    {
+                        "job_id": "worker-job-1",
+                        "status": "completed",
+                        "node_id": "fog-1",
+                        "result": {"pi_estimate": 3.14},
+                        "execution_seconds": 0.01,
+                    },
+                )
+
+        monkeypatch.setattr(scheduler.httpx, "AsyncClient", HangingClient)
+
+        task = asyncio.create_task(
+            scheduler.submit(scheduler.Job(kind="monte_carlo", size=10000, seed=42))
+        )
+        await asyncio.wait_for(post_started.wait(), timeout=1)
+        assert scheduler._in_flight == {"http://fog-1.local:8001": 1}
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert scheduler._in_flight == {}
+
+    asyncio.run(scenario())
 
 
 def test_jobs_returns_503_when_no_worker_is_available(monkeypatch):
