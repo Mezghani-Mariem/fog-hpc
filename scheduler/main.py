@@ -16,6 +16,7 @@ app = FastAPI(title='Fog-HPC Scheduler')
 history = {}
 SCHEDULED = Counter('foghpc_scheduler_jobs_total', 'Jobs dispatched', ['node', 'outcome'])
 LATENCY = Histogram('foghpc_scheduler_dispatch_seconds', 'Dispatch duration')
+_round_robin_index = 0
 
 class Job(BaseModel):
     kind: str
@@ -38,6 +39,36 @@ async def poll_nodes(client):
             results.append({'url': url, 'reachable': False, 'available': False})
     return results
 
+def _node_score(node):
+    return (node.get('running_jobs', 999), node.get('cpu_percent', 100))
+
+def select_nodes(statuses):
+    global _round_robin_index
+
+    eligible = [n for n in statuses if n.get('reachable') and n.get('available')]
+    if not eligible:
+        return []
+
+    grouped = {}
+    for node in eligible:
+        grouped.setdefault(_node_score(node), []).append(node)
+
+    ordered = []
+    for score in sorted(grouped):
+        candidates = grouped[score]
+        if len(candidates) > 1:
+            start = _round_robin_index % len(candidates)
+            _round_robin_index += 1
+            candidates = candidates[start:] + candidates[:start]
+        ordered.extend(candidates)
+    return ordered
+
+def select_node(statuses):
+    ordered = select_nodes(statuses)
+    if not ordered:
+        return None
+    return ordered[0]
+
 @app.get('/nodes')
 async def nodes():
     async with httpx.AsyncClient() as client:
@@ -51,14 +82,12 @@ async def submit(job: Job):
     start = time.perf_counter()
     async with httpx.AsyncClient() as client:
         status = await poll_nodes(client)
-        eligible = [n for n in status if n.get('reachable') and n.get('available')]
-        # Lower running jobs first, then lower CPU utilization.
-        eligible.sort(key=lambda n: (n.get('running_jobs', 999), n.get('cpu_percent', 100)))
-        if not eligible:
+        selected_nodes = select_nodes(status)
+        if not selected_nodes:
             raise HTTPException(503, detail='No available worker')
         # Try a different node only when it explicitly rejects the job (HTTP 503).
         # Timeout is ambiguous: task may still execute, so never blindly retry.
-        for node in eligible:
+        for node in selected_nodes:
             try:
                 r = await client.post(f"{node['url']}/jobs", json=job.model_dump(), timeout=TIMEOUT)
                 if r.status_code == 503:

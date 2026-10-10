@@ -5,6 +5,82 @@ from fastapi.testclient import TestClient
 import scheduler.main as scheduler
 
 
+@pytest.fixture(autouse=True)
+def reset_round_robin_state(monkeypatch):
+    monkeypatch.setattr(scheduler, "_round_robin_index", 0)
+
+
+def worker_status(
+    url,
+    *,
+    reachable=True,
+    available=True,
+    running_jobs=0,
+    cpu_percent=10.0,
+    node_id="fog",
+):
+    return {
+        "url": url,
+        "reachable": reachable,
+        "available": available,
+        "node_id": node_id,
+        "running_jobs": running_jobs,
+        "max_running": 2,
+        "cpu_percent": cpu_percent,
+        "ram_percent": 50.0,
+    }
+
+
+def test_select_node_prefers_fewer_running_jobs():
+    selected = scheduler.select_node(
+        [
+            worker_status("http://fog-1.local:8001", running_jobs=3, cpu_percent=20.0),
+            worker_status("http://fog-2.local:8001", running_jobs=0, cpu_percent=60.0),
+        ]
+    )
+
+    assert selected["url"] == "http://fog-2.local:8001"
+
+
+def test_select_node_uses_lower_cpu_when_running_jobs_are_equal():
+    selected = scheduler.select_node(
+        [
+            worker_status("http://fog-1.local:8001", running_jobs=0, cpu_percent=90.0),
+            worker_status("http://fog-2.local:8001", running_jobs=0, cpu_percent=20.0),
+        ]
+    )
+
+    assert selected["url"] == "http://fog-2.local:8001"
+
+
+def test_select_node_excludes_unreachable_and_unavailable_workers():
+    selected = scheduler.select_node(
+        [
+            worker_status("http://fog-1.local:8001", reachable=False, available=True),
+            worker_status("http://fog-2.local:8001", reachable=True, available=False),
+            worker_status("http://fog-3.local:8001", reachable=True, available=True),
+        ]
+    )
+
+    assert selected["url"] == "http://fog-3.local:8001"
+
+
+def test_select_node_rotates_equal_load_workers_fairly():
+    statuses = [
+        worker_status("http://fog-1.local:8001", running_jobs=0, cpu_percent=20.0),
+        worker_status("http://fog-2.local:8001", running_jobs=0, cpu_percent=20.0),
+    ]
+
+    selections = [scheduler.select_node(statuses)["url"] for _ in range(4)]
+
+    assert selections == [
+        "http://fog-1.local:8001",
+        "http://fog-2.local:8001",
+        "http://fog-1.local:8001",
+        "http://fog-2.local:8001",
+    ]
+
+
 def test_health_returns_configured_node_count(monkeypatch):
     monkeypatch.setattr(
         scheduler,
@@ -142,6 +218,25 @@ def test_jobs_dispatches_valid_monte_carlo_job_to_available_worker(monkeypatch):
         "worker_result": worker_payload,
     }
     assert scheduler.history["scheduler-job-1"] == response_json
+
+
+def test_jobs_returns_503_when_no_worker_is_available(monkeypatch):
+    async def no_available_workers(client):
+        return [
+            worker_status("http://fog-1.local:8001", reachable=False, available=False),
+            worker_status("http://fog-2.local:8001", reachable=True, available=False),
+        ]
+
+    monkeypatch.setattr(scheduler, "poll_nodes", no_available_workers)
+
+    client = TestClient(scheduler.app)
+    response = client.post(
+        "/jobs",
+        json={"kind": "monte_carlo", "size": 10000, "seed": 42},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "No available worker"}
 
 
 @pytest.mark.parametrize(
