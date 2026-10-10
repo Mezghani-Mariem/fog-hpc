@@ -143,6 +143,16 @@ def test_reserve_node_skips_worker_when_effective_capacity_is_reached():
     asyncio.run(scenario())
 
 
+def test_release_node_does_not_create_negative_reservations():
+    async def scenario():
+        await scheduler.release_node("http://fog-1.local:8001")
+
+        assert scheduler._in_flight == {}
+        assert metric_value(scheduler.RESERVATIONS, "configured-1") == 0
+
+    asyncio.run(scenario())
+
+
 def test_health_returns_configured_node_count(monkeypatch):
     monkeypatch.setattr(
         scheduler,
@@ -362,6 +372,59 @@ def test_jobs_dispatches_valid_monte_carlo_job_to_available_worker(monkeypatch):
     assert metric_value(scheduler.SCHEDULED, "fog-2", "completed") == legacy_before + 1
 
 
+def test_job_skips_worker_unavailable_during_polling_and_uses_next_worker(monkeypatch):
+    monkeypatch.setattr(
+        scheduler,
+        "NODES",
+        ["http://fog-1.local:8001", "http://fog-2.local:8001"],
+    )
+    monkeypatch.setattr(scheduler, "history", {})
+    monkeypatch.setattr(scheduler, "uuid4", lambda: "scheduler-job-offline")
+    post_urls = []
+
+    class OfflineThenAvailableClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+        async def get(self, url, timeout):
+            if "fog-1" in url:
+                raise httpx.ConnectError("worker unavailable", request=httpx.Request("GET", url))
+            return FakeResponse(
+                200,
+                worker_status("http://fog-2.local:8001", node_id="fog-2"),
+            )
+
+        async def post(self, url, json, timeout):
+            post_urls.append(url)
+            return FakeResponse(
+                200,
+                {
+                    "job_id": "worker-job-2",
+                    "status": "completed",
+                    "node_id": "fog-2",
+                    "result": {"pi_estimate": 3.14},
+                    "execution_seconds": 0.01,
+                },
+            )
+
+    monkeypatch.setattr(scheduler.httpx, "AsyncClient", OfflineThenAvailableClient)
+
+    client = TestClient(scheduler.app)
+    response = client.post(
+        "/jobs",
+        json={"kind": "monte_carlo", "size": 10000, "seed": 42},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["worker_url"] == "http://fog-2.local:8001"
+    assert post_urls == ["http://fog-2.local:8001/jobs"]
+    assert scheduler.history["scheduler-job-offline"]["status"] == "completed"
+    assert scheduler._in_flight == {}
+
+
 def test_concurrent_jobs_distribute_across_equal_available_workers(monkeypatch):
     async def scenario():
         monkeypatch.setattr(
@@ -424,8 +487,11 @@ def test_reservation_released_after_worker_503_and_next_worker_is_tried(monkeypa
             "NODES",
             ["http://fog-1.local:8001", "http://fog-2.local:8001"],
         )
+        monkeypatch.setattr(scheduler, "history", {})
+        monkeypatch.setattr(scheduler, "uuid4", lambda: "scheduler-job-fallback")
         received_before = metric_value(scheduler.JOBS_RECEIVED)
         completed_before = metric_value(scheduler.JOB_OUTCOMES, "completed")
+        rejected_before = metric_value(scheduler.JOB_OUTCOMES, "rejected")
         rejected_attempt_before = metric_value(scheduler.DISPATCH_ATTEMPTS, "fog-1", "rejected")
         completed_attempt_before = metric_value(scheduler.DISPATCH_ATTEMPTS, "fog-2", "completed")
         post_urls = []
@@ -473,13 +539,73 @@ def test_reservation_released_after_worker_503_and_next_worker_is_tried(monkeypa
             "http://fog-2.local:8001/jobs",
         ]
         assert result["worker_url"] == "http://fog-2.local:8001"
+        assert scheduler.history["scheduler-job-fallback"]["status"] == "completed"
         assert scheduler._in_flight == {}
         assert metric_value(scheduler.RESERVATIONS, "fog-1") == 0
         assert metric_value(scheduler.RESERVATIONS, "fog-2") == 0
         assert metric_value(scheduler.JOBS_RECEIVED) == received_before + 1
         assert metric_value(scheduler.JOB_OUTCOMES, "completed") == completed_before + 1
+        assert metric_value(scheduler.JOB_OUTCOMES, "rejected") == rejected_before
         assert metric_value(scheduler.DISPATCH_ATTEMPTS, "fog-1", "rejected") == rejected_attempt_before + 1
         assert metric_value(scheduler.DISPATCH_ATTEMPTS, "fog-2", "completed") == completed_attempt_before + 1
+
+    asyncio.run(scenario())
+
+
+def test_all_workers_returning_capacity_503_records_rejected_job(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr(
+            scheduler,
+            "NODES",
+            ["http://fog-1.local:8001", "http://fog-2.local:8001"],
+        )
+        monkeypatch.setattr(scheduler, "history", {})
+        monkeypatch.setattr(scheduler, "uuid4", lambda: "scheduler-job-capacity")
+        received_before = metric_value(scheduler.JOBS_RECEIVED)
+        rejected_before = metric_value(scheduler.JOB_OUTCOMES, "rejected")
+        fog1_attempt_before = metric_value(scheduler.DISPATCH_ATTEMPTS, "fog-1", "rejected")
+        fog2_attempt_before = metric_value(scheduler.DISPATCH_ATTEMPTS, "fog-2", "rejected")
+        post_urls = []
+
+        class AllCapacityClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return None
+
+            async def get(self, url, timeout):
+                node_id = "fog-1" if "fog-1" in url else "fog-2"
+                return FakeResponse(
+                    200,
+                    worker_status(url.removesuffix("/status"), node_id=node_id),
+                )
+
+            async def post(self, url, json, timeout):
+                post_urls.append(url)
+                return FakeResponse(503, {"detail": "Worker at capacity"})
+
+        monkeypatch.setattr(scheduler.httpx, "AsyncClient", AllCapacityClient)
+
+        with pytest.raises(HTTPException) as exc:
+            await scheduler.submit(scheduler.Job(kind="monte_carlo", size=10000, seed=42))
+
+        assert exc.value.status_code == 503
+        assert exc.value.detail == "Workers rejected task due to capacity"
+        assert post_urls == [
+            "http://fog-1.local:8001/jobs",
+            "http://fog-2.local:8001/jobs",
+        ]
+        assert scheduler.history["scheduler-job-capacity"] == {
+            "job_id": "scheduler-job-capacity",
+            "status": "rejected",
+            "error": "Workers rejected task due to capacity",
+        }
+        assert scheduler._in_flight == {}
+        assert metric_value(scheduler.JOBS_RECEIVED) == received_before + 1
+        assert metric_value(scheduler.JOB_OUTCOMES, "rejected") == rejected_before + 1
+        assert metric_value(scheduler.DISPATCH_ATTEMPTS, "fog-1", "rejected") == fog1_attempt_before + 1
+        assert metric_value(scheduler.DISPATCH_ATTEMPTS, "fog-2", "rejected") == fog2_attempt_before + 1
 
     asyncio.run(scenario())
 
@@ -487,6 +613,8 @@ def test_reservation_released_after_worker_503_and_next_worker_is_tried(monkeypa
 def test_reservation_released_after_timeout(monkeypatch):
     async def scenario():
         monkeypatch.setattr(scheduler, "NODES", ["http://fog-1.local:8001"])
+        monkeypatch.setattr(scheduler, "history", {})
+        monkeypatch.setattr(scheduler, "uuid4", lambda: "scheduler-job-timeout")
         received_before = metric_value(scheduler.JOBS_RECEIVED)
         unknown_before = metric_value(scheduler.JOB_OUTCOMES, "unknown")
         unknown_attempt_before = metric_value(scheduler.DISPATCH_ATTEMPTS, "fog-1", "unknown")
@@ -514,6 +642,8 @@ def test_reservation_released_after_timeout(monkeypatch):
 
         assert exc.value.status_code == 504
         assert post_urls == ["http://fog-1.local:8001/jobs"]
+        assert scheduler.history["scheduler-job-timeout"]["status"] == "unknown"
+        assert "timeout" in scheduler.history["scheduler-job-timeout"]["error"].lower()
         assert scheduler._in_flight == {}
         assert metric_value(scheduler.RESERVATIONS, "fog-1") == 0
         assert metric_value(scheduler.JOBS_RECEIVED) == received_before + 1
@@ -523,15 +653,17 @@ def test_reservation_released_after_timeout(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_reservation_released_after_http_error(monkeypatch):
+def test_worker_http_500_records_failed_job_without_retry(monkeypatch):
     async def scenario():
         monkeypatch.setattr(scheduler, "NODES", ["http://fog-1.local:8001"])
+        monkeypatch.setattr(scheduler, "history", {})
+        monkeypatch.setattr(scheduler, "uuid4", lambda: "scheduler-job-worker-500")
         received_before = metric_value(scheduler.JOBS_RECEIVED)
         failed_before = metric_value(scheduler.JOB_OUTCOMES, "failed")
         failed_attempt_before = metric_value(scheduler.DISPATCH_ATTEMPTS, "fog-1", "failed")
         post_urls = []
 
-        class ErrorClient:
+        class Worker500Client:
             async def __aenter__(self):
                 return self
 
@@ -544,23 +676,74 @@ def test_reservation_released_after_http_error(monkeypatch):
             async def post(self, url, json, timeout):
                 post_urls.append(url)
                 assert metric_value(scheduler.RESERVATIONS, "fog-1") == 1
-                raise httpx.ConnectError(
-                    "connection failed",
-                    request=httpx.Request("POST", url),
-                )
+                return FakeResponse(500, {"detail": "worker failed"})
 
-        monkeypatch.setattr(scheduler.httpx, "AsyncClient", ErrorClient)
+        monkeypatch.setattr(scheduler.httpx, "AsyncClient", Worker500Client)
 
         with pytest.raises(HTTPException) as exc:
             await scheduler.submit(scheduler.Job(kind="monte_carlo", size=10000, seed=42))
 
         assert exc.value.status_code == 502
         assert post_urls == ["http://fog-1.local:8001/jobs"]
+        assert scheduler.history["scheduler-job-worker-500"] == {
+            "job_id": "scheduler-job-worker-500",
+            "status": "failed",
+            "error": "Worker returned HTTP 500",
+        }
         assert scheduler._in_flight == {}
         assert metric_value(scheduler.RESERVATIONS, "fog-1") == 0
         assert metric_value(scheduler.JOBS_RECEIVED) == received_before + 1
         assert metric_value(scheduler.JOB_OUTCOMES, "failed") == failed_before + 1
         assert metric_value(scheduler.DISPATCH_ATTEMPTS, "fog-1", "failed") == failed_attempt_before + 1
+
+    asyncio.run(scenario())
+
+
+def test_dispatch_transport_error_records_unknown_job_without_retry(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr(scheduler, "NODES", ["http://fog-1.local:8001"])
+        monkeypatch.setattr(scheduler, "history", {})
+        monkeypatch.setattr(scheduler, "uuid4", lambda: "scheduler-job-transport")
+        received_before = metric_value(scheduler.JOBS_RECEIVED)
+        unknown_before = metric_value(scheduler.JOB_OUTCOMES, "unknown")
+        unknown_attempt_before = metric_value(scheduler.DISPATCH_ATTEMPTS, "fog-1", "unknown")
+        failed_before = metric_value(scheduler.JOB_OUTCOMES, "failed")
+        post_urls = []
+
+        class TransportErrorClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return None
+
+            async def get(self, url, timeout):
+                return FakeResponse(200, worker_status("http://fog-1.local:8001", node_id="fog-1"))
+
+            async def post(self, url, json, timeout):
+                post_urls.append(url)
+                assert metric_value(scheduler.RESERVATIONS, "fog-1") == 1
+                raise httpx.ReadError(
+                    "connection reset while reading response",
+                    request=httpx.Request("POST", url),
+                )
+
+        monkeypatch.setattr(scheduler.httpx, "AsyncClient", TransportErrorClient)
+
+        with pytest.raises(HTTPException) as exc:
+            await scheduler.submit(scheduler.Job(kind="monte_carlo", size=10000, seed=42))
+
+        assert exc.value.status_code == 502
+        assert post_urls == ["http://fog-1.local:8001/jobs"]
+        assert scheduler.history["scheduler-job-transport"]["status"] == "unknown"
+        assert scheduler.history["scheduler-job-transport"]["worker_url"] == "http://fog-1.local:8001"
+        assert "ambiguous worker communication failure" in scheduler.history["scheduler-job-transport"]["error"].lower()
+        assert scheduler._in_flight == {}
+        assert metric_value(scheduler.RESERVATIONS, "fog-1") == 0
+        assert metric_value(scheduler.JOBS_RECEIVED) == received_before + 1
+        assert metric_value(scheduler.JOB_OUTCOMES, "unknown") == unknown_before + 1
+        assert metric_value(scheduler.DISPATCH_ATTEMPTS, "fog-1", "unknown") == unknown_attempt_before + 1
+        assert metric_value(scheduler.JOB_OUTCOMES, "failed") == failed_before
 
     asyncio.run(scenario())
 
@@ -615,6 +798,8 @@ def test_reservation_released_after_task_cancellation(monkeypatch):
 
 
 def test_jobs_returns_503_when_no_worker_is_available(monkeypatch):
+    monkeypatch.setattr(scheduler, "history", {})
+    monkeypatch.setattr(scheduler, "uuid4", lambda: "scheduler-job-no-worker")
     received_before = metric_value(scheduler.JOBS_RECEIVED)
     rejected_before = metric_value(scheduler.JOB_OUTCOMES, "rejected")
 
@@ -634,6 +819,12 @@ def test_jobs_returns_503_when_no_worker_is_available(monkeypatch):
 
     assert response.status_code == 503
     assert response.json() == {"detail": "No available worker"}
+    assert scheduler.history["scheduler-job-no-worker"] == {
+        "job_id": "scheduler-job-no-worker",
+        "status": "rejected",
+        "error": "No available worker",
+    }
+    assert scheduler._in_flight == {}
     assert metric_value(scheduler.JOBS_RECEIVED) == received_before + 1
     assert metric_value(scheduler.JOB_OUTCOMES, "rejected") == rejected_before + 1
 

@@ -93,6 +93,20 @@ def _record_job_outcome(outcome, start):
     JOB_OUTCOMES.labels(outcome).inc()
     LATENCY.observe(time.perf_counter() - start)
 
+def _store_rejected_job(job_id, start, detail):
+    history[job_id] = {'job_id': job_id, 'status': 'rejected', 'error': detail}
+    _record_job_outcome('rejected', start)
+
+def _store_unknown_job(job_id, start, node_label, url, error):
+    history[job_id] = {'job_id': job_id, 'status': 'unknown', 'worker_url': url, 'error': error}
+    _record_dispatch_attempt(node_label, 'unknown')
+    _record_job_outcome('unknown', start)
+
+def _store_failed_job(job_id, start, node_label, error):
+    history[job_id] = {'job_id': job_id, 'status': 'failed', 'error': error}
+    _record_dispatch_attempt(node_label, 'failed')
+    _record_job_outcome('failed', start)
+
 def _effective_running_jobs(node, reservations=None):
     reservations = reservations or {}
     return node.get('running_jobs', 999) + reservations.get(node.get('url'), 0)
@@ -186,7 +200,7 @@ async def submit(job: Job):
             node = await reserve_node(status, rejected_urls)
             if not node:
                 detail = 'Workers rejected task due to capacity' if rejected_urls else 'No available worker'
-                _record_job_outcome('rejected', start)
+                _store_rejected_job(job_id, start, detail)
                 raise HTTPException(503, detail=detail)
             url = node['url']
             node_label = _node_label(node)
@@ -206,15 +220,33 @@ async def submit(job: Job):
                 _record_job_outcome('completed', start)
                 return item
             except httpx.TimeoutException:
-                history[job_id] = {'job_id': job_id, 'status': 'unknown', 'worker_url': url,
-                                   'error': 'Request timeout. Do not retry automatically.'}
-                _record_dispatch_attempt(node_label, 'unknown')
-                _record_job_outcome('unknown', start)
+                _store_unknown_job(
+                    job_id,
+                    start,
+                    node_label,
+                    url,
+                    'Request timeout. Do not retry automatically.',
+                )
                 raise HTTPException(504, detail=history[job_id])
-            except (httpx.HTTPError, ValueError) as exc:
-                history[job_id] = {'job_id': job_id, 'status': 'failed', 'error': str(exc)}
-                _record_dispatch_attempt(node_label, 'failed')
-                _record_job_outcome('failed', start)
+            except httpx.HTTPStatusError as exc:
+                _store_failed_job(
+                    job_id,
+                    start,
+                    node_label,
+                    f'Worker returned HTTP {exc.response.status_code}',
+                )
+                raise HTTPException(502, detail=history[job_id])
+            except httpx.RequestError as exc:
+                _store_unknown_job(
+                    job_id,
+                    start,
+                    node_label,
+                    url,
+                    f'Ambiguous worker communication failure: {exc.__class__.__name__}. Do not retry automatically.',
+                )
+                raise HTTPException(502, detail=history[job_id])
+            except ValueError as exc:
+                _store_failed_job(job_id, start, node_label, str(exc))
                 raise HTTPException(502, detail=history[job_id])
             finally:
                 await release_node_safely(url)
