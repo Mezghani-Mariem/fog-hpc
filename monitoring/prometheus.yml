@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: 'fog-hpc'
+    metrics_path: '/metrics'
+    static_configs:
+      # TEST LOCAL : Scheduler + 1 worker sur ton PC.
+      - targets: ['host.docker.internal:8000', 'host.docker.internal:8001']
+      # VRAI DEPLOIEMENT : remplacer par les vraies IP LAN, par exemple :
+      # - targets: ['host.docker.internal:8000', 'IP1:8001', 'IP2:8001', 'IP3:8001']
